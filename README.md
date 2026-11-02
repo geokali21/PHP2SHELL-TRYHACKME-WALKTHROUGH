@@ -40,7 +40,7 @@ Zend Engine v4.4.26, Copyright (c), by Zend Technologies
     with Zend OPcache v8.4.26, Copyright (c), by Zend Technologies
 ```
 
-![Recon: docker ps dan php -v di target](05-docker-ps-recon.jpg)
+![Recon: docker ps dan php -v di target](images/05-docker-ps-recon.jpg)
 
 Targetnya PHP 8.4.26, jalan di Apache, dan portnya di-expose ke `127.0.0.1:8088`.
 
@@ -61,7 +61,7 @@ Simpel banget — tapi justru itu intinya. Bug-nya bukan di kode aplikasi, tapi 
 
 Fitur `session.upload_progress` di PHP dirancang buat nge-track progress upload file lewat `$_SESSION`. Begini alurnya, sesuai diagram resmi dari materi room:
 
-![Upload progress runs before your code does](01-upload-progress-flow.jpg)
+![Upload progress runs before your code does](images/01-upload-progress-flow.jpg)
 
 Kalau request `POST` multipart bawa field `PHP_SESSION_UPLOAD_PROGRESS` plus satu file part, PHP langsung nulis data progress ke session — **sebelum** `session_start()` dipanggil, bahkan sebelum satu baris pun kode aplikasi jalan. Prosesnya: **Parse body** (upload-progress nulis ke `$_SESSION`) → **RINIT** (request start-up, SAPI callback) → **Run script** (`index.php` baru dieksekusi).
 
@@ -73,7 +73,7 @@ Attacker udah "nyampe" di titik **RINIT**, pre-auth — gak perlu `session_start
 
 Chain exploit-nya dibagi jadi 4 tahap request, dan tiap tahap itu cuma POST multipart biasa — dari sisi luar, target cuma bakal ngebales `OK` terus. Ini alur resminya:
 
-![Four requests turn a crash into a shell](02-four-requests-chain.jpg)
+![Four requests turn a crash into a shell](images/02-four-requests-chain.jpg)
 
 **1. Rotate** → crash worker, fork yang baru. **2. Leak heap** → `Set-Cookie` OOB read, bocorin heap base. **3. Leak libphp** → leak kedua, ASLR dikalahin. **4. Forge** → fake HashTable, `pDestructor = system`. Hasil akhirnya: **code execution**, `uid=33 (www-data)`.
 
@@ -81,7 +81,7 @@ Chain exploit-nya dibagi jadi 4 tahap request, dan tiap tahap itu cuma POST mult
 
 Di balik layar, ada bug *use-after-free* (CWE-824): waktu PHP manggil `free()` di satu blok memory, pointer-nya **gak di-clear**, karena ada *longjmp bailout* yang motong jalur cleanup normal.
 
-![A memory bailout skips the cleanup](03-memory-bailout.jpg)
+![A memory bailout skips the cleanup](images/03-memory-bailout.jpg)
 
 Alurnya: **A. free() satu blok memory** → *harusnya* clear pointer, tapi **di-skip** karena longjmp bailout → jadinya **dangling pointer** (freed, gak di-clear). Begitu **B. request berikutnya** nyasar ke **worker PHP-FPM yang sama**, engine ikut pointer yang udah stale itu.
 
@@ -91,7 +91,7 @@ Request pertama di chain ini fungsinya buat mancing worker supaya crash dan di-r
 
 Begitu dapet worker baru, trik berikutnya adalah manfaatin `PHPSESSID` buat bikin PHP ngebalikin memory lebih banyak dari yang seharusnya lewat header `Set-Cookie`:
 
-![The cookie header hands back the server's memory](04-cookie-oob-read.jpg)
+![The cookie header hands back the server's memory](images/04-cookie-oob-read.jpg)
 
 `PHPSESSID` itu normalnya cuma id 32 byte. Tapi length field-nya digedein jadi ~67 KB, bukan 32 byte — jadi yang kebawa balik bukan cuma id, tapi juga memory worker di sebelahnya: password, session cookie, API key, TLS private key, sampe alamat-alamat kode. Semua itu nongol di response `Set-Cookie: PHPSESSID = ...`, tinggal dibaca attacker.
 
@@ -128,7 +128,7 @@ ubuntu@tryhackme-2404:~/php2shell-bypass-aslr-exp$ python3 exploit.py -u http://
 PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
 
-![Exploit jalan, proof uid=33(www-data) muncul](06-exploit-run-proof.jpg)
+![Exploit jalan, proof uid=33(www-data) muncul](images/06-exploit-run-proof.jpg)
 
 Satu file PHP cuma `echo "OK"`, nol login, nol RCE yang "keliatan" di permukaan — tapi tetep ketemu `uid=33(www-data)`. Kocak emang, tapi ya gitu itu intinya race condition + UAF + info leak kalo digabung.
 
@@ -154,7 +154,7 @@ ASLR_PATHS.md  ASLR_PURE_HTTP_RESEARCH.md  HTTP_HEAP_LEAK.md  NOTES.md  NO_DISPL
 ASLR_PURE_HTTP.md  DISPLAY_ERRORS_OFF.md  NOASLR_REPORT.md  NOTES_BG.md  README.md  out  src
 ```
 
-![curl index.php cuma balikin OK, isi exploit folder lumayan rame](07-curl-ls-files.jpg)
+![curl index.php cuma balikin OK, isi exploit folder lumayan rame](images/07-curl-ls-files.jpg)
 
 Begitu exploit udah kebukti jalan, tinggal diarahin ke command yang kita mau — baca file flag dan simpen hasilnya ke file lokal via `--proof-file`:
 
@@ -175,7 +175,7 @@ ubuntu@tryhackme-2404:~/php2shell-bypass-aslr-exp$ python3 exploit.py -u http://
 PROOF: THM{...isi-flag-kamu-disini...}
 ```
 
-![Flag akhirnya nongol, format THM{...}](08-flag-proof.jpg)
+![Flag akhirnya nongol, format THM{...}](images/08-flag-proof.jpg)
 
 > Flag-nya bakal muncul dengan format `THM{...}`. Di screenshot aslinya flag-nya aku blur — ganti sama flag punya kamu sendiri sebelum di-publish.
 
@@ -191,4 +191,4 @@ Room ini ngasih liat gimana satu fitur PHP yang kedengerannya "kecil" (`session.
 
 ---
 
-*Ditulis berdasarkan catatan & screenshot pribadi pas ngerjain room php2shell di TryHackMe.
+*Ditulis berdasarkan catatan & screenshot pribadi pas ngerjain room php2shell di TryHackMe.*
