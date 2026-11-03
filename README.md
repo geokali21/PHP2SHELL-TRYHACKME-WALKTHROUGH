@@ -1,6 +1,13 @@
 # TryHackMe — php2shell Walkthrough
 
-> Room **php2shell** di TryHackMe ngebahas gimana caranya dapetin RCE (Remote Code Execution) di PHP-FPM lewat bug *use-after-free* di fitur `upload_progress`. Serunya, seluruh exploit-nya dijalanin **tanpa login, tanpa autentikasi** — cuma modal HTTP request biasa ke endpoint yang nerima POST.
+> php2shell itu chain vulnerability di **runtime PHP** yang ujung-ujungnya bisa bocorin memory sampe remote code execution (RCE). Beda sama bug level aplikasi kayak SQL injection, ini bug-nya nempel di logic internal PHP sendiri — soal gimana dia parsing request dan ngatur memory.
+
+Room ini ngebahas 2 kerentanan:
+
+- **CVE-2026-109618** — Memory disclosure
+- **CVE-2026-109619** — Remote code execution
+
+Serunya, seluruh exploit-nya dijalanin **tanpa login, tanpa autentikasi** — cuma modal HTTP request biasa ke endpoint yang nerima POST.
 
 ---
 
@@ -17,16 +24,26 @@ Tapi dari satu baris kode itu doang, kita bisa:
 2. Bocorin alamat memory heap
 3. Bocorin base address `libphp` buat ngalahin ASLR
 4. Forge struktur HashTable palsu di memory
-5. Arahin `pDestructor` ke fungsi `system()`
+5. Arahin function pointer-nya ke `system()`
 6. Dapet command execution sebagai `www-data`
-
-Semua itu lewat request multipart `POST` yang keliatannya biasa aja.
 
 ---
 
-## 1. Recon — Lihat Target-nya Apa
+## 1. Gimana Cara Kerjanya (High Level)
 
-Login ke box, cek container yang jalan:
+Fitur `session.upload_progress` di PHP dirancang buat nge-track progress upload file. Masalahnya, PHP bisa memproses data upload-progress itu **sebelum** script aplikasi kamu sempat jalan sama sekali.
+
+Menurut materi room-nya: kondisi *out-of-memory* bisa memicu *bailout* lewat `longjmp()`. Kalau bailout ini motong proses di tengah jalan — pas state internal PHP lagi gak konsisten — ada pointer yang bisa tetep nunjuk ke memory yang udah di-*free*.
+
+![Upload progress runs before your code does](images/01-upload-progress-flow.jpg)
+
+Alur singkatnya: **Parse body** (upload-progress nulis ke `$_SESSION`) → **RINIT** (request start-up, SAPI callback) → **Run script** (`index.php` baru dieksekusi). Attacker udah "nyampe" di titik RINIT, pre-auth — gak perlu `session_start()`, gak perlu login, gak perlu kode aplikasi apapun. Endpoint manapun yang nerima POST bisa dipakai.
+
+---
+
+## 2. Lab Reconnaissance
+
+Pertama, cek container Docker yang jalan dan versi PHP-nya:
 
 ```bash
 ubuntu@tryhackme-2404:~$ docker ps
@@ -42,9 +59,9 @@ Zend Engine v4.4.26, Copyright (c), by Zend Technologies
 
 ![Recon: docker ps dan php -v di target](images/05-docker-ps-recon.jpg)
 
-Targetnya PHP 8.4.26, jalan di Apache, dan portnya di-expose ke `127.0.0.1:8088`.
+`php2shell-target` itu nama container Docker yang ngejalanin server PHP yang vulnerable di lab TryHackMe-nya.
 
-Isi webroot-nya cuma satu baris:
+Terus, dicek juga endpoint web-nya dan source code-nya:
 
 ```bash
 ubuntu@tryhackme-2404:~$ curl -s http://127.0.0.1:8088/index.php
@@ -53,63 +70,76 @@ ubuntu@tryhackme-2404:~$ docker exec php2shell-target cat /var/www/html/index.ph
 <?php echo "OK\n"; ?>
 ```
 
-Simpel banget — tapi justru itu intinya. Bug-nya bukan di kode aplikasi, tapi di **engine PHP-FPM sendiri** waktu dia parsing body request, jauh sebelum `index.php` sempat dieksekusi.
+Aplikasinya cuma punya satu statement doang yang nge-print `OK`. Ini nunjukin kalau vulnerability yang dibahas di room ini emang ada di **runtime PHP**, bukan di kode aplikasinya sendiri.
 
 ---
 
-## 2. Konsep Bug: Upload Progress Jalan Sebelum Kode Kamu
+## 3. Root Cause: Bailout dan Dangling Pointer
 
-Fitur `session.upload_progress` di PHP dirancang buat nge-track progress upload file lewat `$_SESSION`. Begini alurnya, sesuai diagram resmi dari materi room:
+Sebelum masuk ke exploit-nya, ada beberapa istilah yang perlu dipahami dulu:
 
-![Upload progress runs before your code does](images/01-upload-progress-flow.jpg)
+- **Bailout** — mekanisme darurat PHP buat "kabur" dari kondisi fatal tertentu.
+- **Dangling pointer** — pointer yang masih nunjuk ke suatu memory, padahal memory itu udah di-*free*.
+- **Memory disclosure** — kondisi di mana aplikasi/proses ngebocorin data dari memory-nya.
+- **ASLR** — *Address Space Layout Randomization*, teknik yang bikin lokasi memory susah ditebak.
+- **RCE** — *Remote Code Execution*, attacker bisa jalanin command dengan privilege proses yang kena.
 
-Kalau request `POST` multipart bawa field `PHP_SESSION_UPLOAD_PROGRESS` plus satu file part, PHP langsung nulis data progress ke session — **sebelum** `session_start()` dipanggil, bahkan sebelum satu baris pun kode aplikasi jalan. Prosesnya: **Parse body** (upload-progress nulis ke `$_SESSION`) → **RINIT** (request start-up, SAPI callback) → **Run script** (`index.php` baru dieksekusi).
+Room ini nyebut `session.upload_progress` sebagai fitur yang ngasih **entry point** buat serangan. Fitur itu sendiri bukan vulnerability-nya — dia cuma jalan masuknya.
 
-Attacker udah "nyampe" di titik **RINIT**, pre-auth — gak perlu `session_start()`, gak perlu login, gak perlu kode aplikasi apapun. Endpoint manapun yang nerima POST bisa dipakai.
+### Analogi Sederhana: Kursi yang Dipakai Ulang
 
----
+Bayangin ada ruangan dengan kursi yang ditandain buat **User 1**. User 1 pergi, kursinya diambil/dipindah, tapi daftar denah tempat duduk masih nunjukin posisi kursi lama itu.
 
-## 3. Dari Crash Jadi Shell: 4 Request
+Abis itu, **User 2** dateng dan ditempatin di posisi yang sama (ruang yang sama dipake ulang). Tapi denah lama itu gak pernah di-update.
 
-Chain exploit-nya dibagi jadi 4 tahap request, dan tiap tahap itu cuma POST multipart biasa — dari sisi luar, target cuma bakal ngebales `OK` terus. Ini alur resminya:
-
-![Four requests turn a crash into a shell](images/02-four-requests-chain.jpg)
-
-**1. Rotate** → crash worker, fork yang baru. **2. Leak heap** → `Set-Cookie` OOB read, bocorin heap base. **3. Leak libphp** → leak kedua, ASLR dikalahin. **4. Forge** → fake HashTable, `pDestructor = system`. Hasil akhirnya: **code execution**, `uid=33 (www-data)`.
-
-### Step 1 — Rotate (Crash & Respawn Worker)
-
-Di balik layar, ada bug *use-after-free* (CWE-824): waktu PHP manggil `free()` di satu blok memory, pointer-nya **gak di-clear**, karena ada *longjmp bailout* yang motong jalur cleanup normal.
+Kalau ada orang yang masih ngikutin denah lama, dia bakal nyasar ke posisi User 2 — padahal dia kira itu masih posisi User 1.
 
 ![A memory bailout skips the cleanup](images/03-memory-bailout.jpg)
 
-Alurnya: **A. free() satu blok memory** → *harusnya* clear pointer, tapi **di-skip** karena longjmp bailout → jadinya **dangling pointer** (freed, gak di-clear). Begitu **B. request berikutnya** nyasar ke **worker PHP-FPM yang sama**, engine ikut pointer yang udah stale itu.
+Nah, ini mirip banget sama dangling pointer: memory-nya udah di-*free* dan dipake ulang, tapi ada pointer lama yang masih nunjuk ke alamat lama itu.
 
-Request pertama di chain ini fungsinya buat mancing worker supaya crash dan di-restart sama FPM manager, biar kita dapet worker fresh dengan state yang bisa diprediksi.
+Di lab php2shell, urutannya kira-kira begini:
 
-### Step 2 — Leak Heap via Cookie OOB Read
+1. **Request 1** memicu kondisi out-of-memory bailout yang dijelasin tadi.
+2. State internal PHP jadi gak konsisten.
+3. Memory yang udah di-*free* itu bisa dipakai ulang.
+4. **Request 2** nyampe ke worker yang sama, dan nemuin state yang udah "basi" itu.
+5. Exploit-nya manfaatin kondisi ini buat memory disclosure, dan ujungnya buat RCE.
 
-Begitu dapet worker baru, trik berikutnya adalah manfaatin `PHPSESSID` buat bikin PHP ngebalikin memory lebih banyak dari yang seharusnya lewat header `Set-Cookie`:
+Worker process itu penting di sini karena dia bisa nanganin banyak request selama hidupnya. Kalau state yang korup bertahan setelah request pertama, request berikutnya yang kebetulan nyasar ke worker yang sama bisa ikut kena dampaknya.
 
-![The cookie header hands back the server's memory](images/04-cookie-oob-read.jpg)
-
-`PHPSESSID` itu normalnya cuma id 32 byte. Tapi length field-nya digedein jadi ~67 KB, bukan 32 byte — jadi yang kebawa balik bukan cuma id, tapi juga memory worker di sebelahnya: password, session cookie, API key, TLS private key, sampe alamat-alamat kode. Semua itu nongol di response `Set-Cookie: PHPSESSID = ...`, tinggal dibaca attacker.
-
-### Step 3 — Leak libphp (Ngalahin ASLR)
-
-Dari heap leak di step 2, exploit ngulang pola yang sama buat bocorin base address dari `libphp` — library inti PHP yang isinya semua fungsi internal engine. Begitu base address-nya ketahuan, ASLR (Address Space Layout Randomization) efektif gak berguna lagi, karena semua offset function di dalam `libphp` itu statis relatif terhadap base-nya.
-
-### Step 4 — Forge Fake HashTable → `system()`
-
-Ini bagian paling "jahat"-nya. Dengan alamat heap dan alamat `libphp` yang udah diketahui, exploit nyusun **struktur HashTable palsu** di memory dan nge-set field `pDestructor`-nya supaya nunjuk ke fungsi `system()`.
-
-Begitu PHP internal manggil destructor buat "ngebersihin" struktur itu (hal yang normalnya aman), yang beneran kepanggil adalah `system()` — dan command execution pun kejadian: **code execution, `uid=33 (www-data)`**.
+> Catatan: analogi ini buat ngejelasin stale memory antar-request. Reverse shell itu beda — itu shell command yang connect balik ke operator. Dangling pointer doang gak otomatis bikin reverse shell.
 
 ---
 
-## 4. Eksekusi Exploit-nya
+## 4. Memory Disclosure — CVE-2026-109618
 
-Script `exploit.py` ngejalanin 4 tahap di atas secara otomatis lewat HTTP murni, pakai offset-offset yang udah pre-computed:
+Room-nya ngejelasin gimana pointer session-identifier yang "basi" itu bisa salah ditangani, sampe bikin memory proses di sebelahnya kebocor lewat header response HTTP:
+
+```
+Set-Cookie: PHPSESSID
+```
+
+![The cookie header hands back the server's memory](images/04-cookie-oob-read.jpg)
+
+Normalnya, header ini cuma isi session identifier. Tapi di vulnerability yang dijelasin room ini, PHP ceritanya baca lebih jauh dari identifier yang sah, dan jadi ngebocorin memory proses tambahan.
+
+Exploit-nya nyoba balikin dua alamat:
+
+- **Base address heap chunk**
+- **Base address library PHP (`libphp`)**
+
+Dua alamat ini bantu ngurangin efektivitas ASLR, karena sekarang keliatan di mana region memory yang relevan itu ditempatin.
+
+---
+
+## 5. Remote Code Execution — CVE-2026-109619
+
+Room-nya ngejelasin stage kedua sebagai korupsi struktur internal PHP yang berhubungan sama HashTable. Pas proses cleanup, engine-nya bisa ngikutin function pointer yang gak seharusnya, bukan rutin cleanup yang asli.
+
+![Four requests turn a crash into a shell](images/02-four-requests-chain.jpg)
+
+Exploit-nya pake alamat-alamat memory yang udah didapet sebelumnya buat nyoba command execution. Script `exploit.py` ngejalanin seluruh tahap ini otomatis lewat HTTP murni:
 
 ```bash
 ubuntu@tryhackme-2404:~/php2shell-bypass-aslr-exp$ python3 exploit.py -u http://127.0.0.1:8088/index.php -c 'id>/out/p1'
@@ -130,25 +160,11 @@ PROOF: uid=33(www-data) gid=33(www-data) groups=33(www-data)
 
 ![Exploit jalan, proof uid=33(www-data) muncul](images/06-exploit-run-proof.jpg)
 
-Satu file PHP cuma `echo "OK"`, nol login, nol RCE yang "keliatan" di permukaan — tapi tetep ketemu `uid=33(www-data)`. Kocak emang, tapi ya gitu itu intinya race condition + UAF + info leak kalo digabung.
-
-Beberapa catatan dari output di atas:
-
-- **offsets.env** — exploit butuh offset function-function tertentu (`zif`, `dtor`, `htdata`) relatif terhadap base `libphp`. Offset-offset ini udah dihitung sebelumnya, lalu dipakai ulang di sini.
-- **"rotating worker over HTTP"** — terjadi berkali-kali, soalnya tiap worker FPM punya layout memory sendiri; exploit perlu "jatah" worker yang fresh dan predictable di tiap stage.
-- **PROOF: uid=33(www-data)** — bukti command `id` berhasil dieksekusi di sisi server, dan hasilnya nunjukin kita jalan sebagai user `www-data`.
-
----
-
-## 5. Ambil Flag-nya
-
-Cek dulu isi direktori kerja exploit, dan konfirmasi target masih cuma ngeprint `OK`:
+Ini konfirmasi command execution sebagai `www-data`, akun web server-nya. Dari titik ini, attacker secara teori bisa jalanin command lain lewat RCE ini.
 
 ```bash
 ubuntu@tryhackme-2404:~$ curl -s http://127.0.0.1:8088/index.php
 OK
-ubuntu@tryhackme-2404:~$ docker exec php2shell-target cat /var/www/html/index.php
-<?php echo "OK\n"; ?>
 ubuntu@tryhackme-2404:~$ ls ~/php2shell-bypass-aslr-exp
 ASLR_PATHS.md  ASLR_PURE_HTTP_RESEARCH.md  HTTP_HEAP_LEAK.md  NOTES.md  NO_DISPLAY_ERRORS.md  docker  exploit.py  logs  readme.md
 ASLR_PURE_HTTP.md  DISPLAY_ERRORS_OFF.md  NOASLR_REPORT.md  NOTES_BG.md  README.md  out  src
@@ -156,7 +172,11 @@ ASLR_PURE_HTTP.md  DISPLAY_ERRORS_OFF.md  NOASLR_REPORT.md  NOTES_BG.md  README.
 
 ![curl index.php cuma balikin OK, isi exploit folder lumayan rame](images/07-curl-ls-files.jpg)
 
-Begitu exploit udah kebukti jalan, tinggal diarahin ke command yang kita mau — baca file flag dan simpen hasilnya ke file lokal via `--proof-file`:
+---
+
+## 6. Flag
+
+Setelah command execution kebukti jalan, tinggal pake command yang disediain room buat ambil flag-nya:
 
 ```bash
 ubuntu@tryhackme-2404:~/php2shell-bypass-aslr-exp$ python3 exploit.py -u http://127.0.0.1:8088/index.php -c 'cat /f>/out/p1' --proof-file out/p1
@@ -172,7 +192,7 @@ ubuntu@tryhackme-2404:~/php2shell-bypass-aslr-exp$ python3 exploit.py -u http://
 [*] rotating worker over HTTP
 [*] stage 3: HTDATA=0x7ecc1ee690d8 ZIF=0x7ecc20e93370
 [+] W3 attempt 1
-PROOF: THM{...isi-flag-kamu-disini...}
+PROOF: THM{......}
 ```
 
 ![Flag akhirnya nongol, format THM{...}](images/08-flag-proof.jpg)
@@ -181,13 +201,27 @@ PROOF: THM{...isi-flag-kamu-disini...}
 
 ---
 
-## 6. Kesimpulan
+## 7. Detection dan Mitigasi
 
-Room ini ngasih liat gimana satu fitur PHP yang kedengerannya "kecil" (`session.upload_progress`) bisa jadi primitive buat full RCE pre-auth, kalau dikombinasiin dengan bug memory management (use-after-free) dan teknik leak yang pinter buat ngalahin ASLR. Beberapa poin penting:
+**Detection:** Perhatiin cookie `PHPSESSID` yang ukurannya gak wajar gede, request `POST` multipart yang mencurigakan, error memory PHP, dan worker yang crash gak kayak biasanya.
 
-- **Pre-auth itu nyata** — attacker gak butuh login atau kode aplikasi yang "vulnerable" di permukaan; endpoint manapun yang nerima `POST` bisa jadi pintu masuk.
-- **Info leak = kunci ngalahin mitigasi** — ASLR itu efektif selama attacker gak tau base address. Begitu ada OOB read sekecil apapun (di sini lewat `Set-Cookie`), seluruh proteksi itu runtuh.
-- **Use-after-free itu berbahaya karena predictable** — begitu pointer yang stale bisa dipicu secara konsisten lewat urutan request tertentu, dia berubah dari sekadar bug stabilitas jadi primitive buat arbitrary code execution.
+**Mitigasi:**
+
+- **Update PHP** ke versi yang udah di-fix. Untuk PHP 8.4, lab ini nyebut **8.4.27** sebagai fixed release — tapi tetep cek security advisory resminya dulu sebelum patch sistem produksi beneran.
+- **Rebuild container** dan restart semua worker PHP-FPM.
+- Kalau fitur `upload_progress` emang gak kepake, mending **dimatiin aja**:
+
+```ini
+session.upload_progress.enabled = 0
+```
+
+> ⚠️ Verifikasi dulu ke security advisory resmi sebelum patch sistem produksi — nomor versi "fixed" di atas konteksnya lab TryHackMe, bukan jaminan buat semua environment.
+
+---
+
+## Key Takeaway
+
+php2shell nunjukin gimana satu bug memory di runtime PHP bisa berujung ke **memory disclosure** sekaligus **remote code execution** — tanpa butuh satu baris kode aplikasi yang "vulnerable". Patch-nya ada di level engine, bukan di level aplikasi.
 
 ---
 
